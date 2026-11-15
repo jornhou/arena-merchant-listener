@@ -430,11 +430,54 @@ class AutoCapture:
     def rate(self):
         return self.cap.rate
 
+    @property
+    def counter(self):
+        """已读到的采样数；设备掉线时它就不涨了，用来判断"还活着没"。"""
+        return getattr(self.cap, "counter", 0)
+
+    @property
+    def pa(self):
+        return self.cap.pa
+
     def pick(self, scan, floor=0.0008):
         return self.cap.pick(scan)
 
     def close(self):
         self.cap.close()
+
+
+def reconnect(old, overlay=None, tries=10):
+    """设备被拔掉、系统默认输出换走之后，关掉旧的重新接一台。
+
+    老实现只在启动时开一次设备：设备一消失，后台读数据的线程会把异常吞掉，
+    counter 不再增长，界面还写着"正在听"，其实早就听不见了。这里负责恢复。
+    """
+    try:
+        old.close()
+    except Exception:
+        pass
+    delay = 0.5
+    for n in range(1, tries + 1):
+        if overlay:
+            overlay.set_dev("正在重连音频设备…")
+        try:
+            c = AutoCapture(DEVICE)
+            print("已接上设备：%s（%d Hz）" % (c.dev["name"], c.rate), flush=True)
+            if overlay:
+                overlay.set_dev(c.dev["name"])
+            return c
+        except SystemExit:
+            pass
+        except Exception as e:
+            if VERBOSE:
+                print("  重连失败：%s" % e, flush=True)
+        if n >= 4:
+            delay = 1.0
+        time.sleep(delay)
+    print("重连 10 次都失败：现在找不到能用的音频设备。"
+          "请确认游戏出声的输出设备还在，然后重新打开程序。", flush=True)
+    print("（如果只是临时拔了耳机，一直插回去再开就行。）", flush=True)
+    raise SystemExit(0)
 
 
 def rms(a):
@@ -866,6 +909,14 @@ def listen(refs, overlay=None, seconds=None, cap=None):
     due = 0.0
     last_peak = {}
     last_weak = {}      # 这一声上次报的是"低可信"吗？是的话允许被高分结果更正
+    last_cnt = getattr(cap, "counter", 0)
+    last_progress = time.time()
+    last_devchk = time.time()
+    try:
+        follow_default = not cap._saved()
+    except Exception:
+        follow_default = True
+    force_at = float(os.environ.get("ZD_RECONNECT_AFTER", "0") or 0)
     print("比对窗口 %.1fs，间隔 %.2fs" % (scan / rate, tick), flush=True)
     rec = [] if RECORD_PATH else None
     try:
@@ -875,6 +926,39 @@ def listen(refs, overlay=None, seconds=None, cap=None):
             READY.set()
             got = cap.pick(scan)          # 拿最新窗口（Capture 顺便读一小块，AutoCapture 由后台线程喂）
             now_t = time.time()
+
+            # 设备守护：①「还活着没」看 counter 涨不涨；② 系统默认输出换了就跟过去
+            if force_at and now_t - t0 > force_at:
+                force_at = 0.0
+                print("（自检）手动触发一次设备重连", flush=True)
+                cap = reconnect(cap, overlay)
+                last_cnt, last_progress, due = cap.counter, time.time(), 0.0
+                last_peak.clear()      # 新对象计数从 0 重来，旧的去重记录必须丢掉
+                last_weak.clear()
+                continue
+            cur_cnt = cap.counter
+            if cur_cnt != last_cnt:
+                last_cnt, last_progress = cur_cnt, now_t
+            elif now_t - last_progress > 3.0:
+                print("音频设备停了（3 秒没读到新数据），自动重连…", flush=True)
+                cap = reconnect(cap, overlay)
+                last_cnt, last_progress, due = cap.counter, time.time(), 0.0
+                last_peak.clear()      # 新对象计数从 0 重来，旧的去重记录必须丢掉
+                last_weak.clear()
+                continue
+            if follow_default and now_t - last_devchk > 5.0:
+                last_devchk = now_t
+                dflt = None
+                try:
+                    dflt = cap.pa.get_default_wasapi_loopback()["index"]
+                except Exception:
+                    dflt = None
+                if dflt is not None and dflt != cap.dev["index"]:
+                    print("系统默认输出变成了别的设备，跟着切过去…", flush=True)
+                    cap = reconnect(cap, overlay)
+                    last_cnt, last_progress, due = cap.counter, time.time(), 0.0
+                    continue
+
             if now_t - due < tick:
                 time.sleep(0.03)      # 别空转，空转会把后台读音频的线程饿死
                 continue
