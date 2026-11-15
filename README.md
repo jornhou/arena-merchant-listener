@@ -8,7 +8,7 @@
 
 ## 直接下载（不想装 Python 就看这一节）
 
-**[→ 下载免安装版](https://github.com/zhenninghou221-afk/arena-merchant-listener/releases/latest)**（最新为 v1.0.1，带程序图标与版本信息）
+**[→ 下载免安装版](https://github.com/jornhou/arena-merchant-listener/releases/latest)**（最新为 v1.0.1，带程序图标与版本信息）
 
 适用于 Windows 10 / 11 64 位，双击即用：
 
@@ -153,7 +153,7 @@ arena-merchant-listener/
 
 ## 许可
 
-[Apache License 2.0](LICENSE) © 2026 zhenninghou221-afk
+[Apache License 2.0](LICENSE) © 2026 jornhou
 
 你可以自由使用、修改、商用、再分发，但必须保留 `LICENSE` 与 `NOTICE`；修改过的文件要注明已修改。第三方素材与数据的归属见 [`NOTICE`](NOTICE)。
 
