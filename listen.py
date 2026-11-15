@@ -24,10 +24,26 @@ import wave
 import numpy as np
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+
+
+def state_dir():
+    """用户状态目录（记住的设备、界面偏好）：%LOCALAPPDATA%\战地行商听声辨物。
+
+    免安装版里 HERE 是临时解压目录，进程一退就删，不能往里写。
+    """
+    base = os.environ.get("LOCALAPPDATA") or os.path.expanduser("~")
+    p = os.path.join(base, "战地行商听声辨物")
+    try:
+        os.makedirs(p, exist_ok=True)
+    except Exception:
+        pass
+    return p
+
+
 SR = 48000          # 采集与素材采样率
 TSR = 16000         # 比对用降采样率
 STRIDE = SR // TSR
-NFFT = 65536
+NFFT = 32768
 WIN_SEC = 1.45      # 每次事件取多长的窗口
 PREROLL = 0.06      # 提前一点，避免切掉起音
 DEVICE = None       # --device 指定的设备名片段
@@ -38,12 +54,16 @@ RECORD_PATH = None  # 调试：把采集到的声音存成 wav
 # 音色指纹：16k 采样下 2048 点 FFT（频率分辨率 7.8Hz），24 个对数频带
 NBAND = 24
 W_NCC = 0.85        # 波形相关权重（离线核对：≥0.85 全对，再低就会把 04/05 认混）
-W_TONE = 0.15       # 音色余弦权重
+W_TONE = 0.15       # 音色余弦权重（实测 0.15 最优，调到 0.25/0.35 反而更差）
+AUG_N = 3           # 每类模板的增广份数：叠不同频响倾斜，吸收扬声器/耳机差异
+COARSE_K = 8        # 粗筛保留的候选类数，避免全量比对拖慢实时
+RECHECK_SCORE = 0.60  # 首选分数低于这个值就退回全量精算，防止粗筛漏掉真答案
 BEDGE = np.round(np.geomspace(80.0, 7000.0, NBAND + 1) / (TSR / 2048)).astype(int)
 
 
 # ---------------------------------------------------------------- 素材
 def load_refs(snd_dir, groups):
+    rng = np.random.default_rng(20261114)
     refs = []
     for g in groups:
         path = os.path.join(snd_dir, "snd%02d.wav" % g["id"])
@@ -62,13 +82,16 @@ def load_refs(snd_dir, groups):
         if fr != SR:
             raise SystemExit("素材采样率不是 48k：%s" % path)
         t = preprocess(x)
-        refs.append({
-            "id": g["id"], "name": g["name"], "info": g,
-            "len": len(t),
-            "fft": np.fft.rfft(t, NFFT),
-            "energy": float(np.sum(t * t)),
-            "band": bandvec(t),
-        })
+        for k in range(AUG_N):
+            tv = t if k == 0 else tilt_var(t, float(rng.uniform(-0.32, 0.32)))
+            refs.append({
+                "id": g["id"], "name": g["name"], "info": g,
+                "len": len(tv),
+                "fft": np.fft.rfft(tv, NFFT),
+                "energy": float(np.sum(tv * tv)),
+                "band": bandvec(tv),
+                "aug": k,
+            })
     return refs
 
 
@@ -81,6 +104,15 @@ def preprocess(x):
     n = len(d) // STRIDE
     d = d[: n * STRIDE].reshape(n, STRIDE)
     y = d.mean(axis=1)
+    y = y - y.mean()
+    return y.astype(np.float32)
+
+
+def tilt_var(t, a):
+    """给模板叠一个一阶倾斜，模拟别的扬声器/耳机听同一段声音时的频响差异。"""
+    y = np.empty_like(t)
+    y[0] = t[0]
+    y[1:] = t[1:] - a * t[:-1]
     y = y - y.mean()
     return y.astype(np.float32)
 
@@ -102,10 +134,48 @@ def bandvec(seg):
     return v / nrm
 
 
-def match(refs, win):
-    """返回 [(score, ref, lag16), ...] 降序；lag16 是素材在窗口里的起点（16k 采样点）。
+def _ncc_at(w, W, cs, n, r):
+    """单条模板的归一化互相关峰值，返回 (峰值, 峰值处起点 lag)。"""
+    L = r["len"]
+    den_e = max(r["energy"], 1e-12)
+    if L >= n:
+        t = np.fft.irfft(np.conj(r["fft"]) * W, NFFT)[:n]
+        return float(np.sum(t)) / np.sqrt(max(cs[n], 1e-12) * den_e), 0
+    m = n - L + 1
+    cc = np.fft.irfft(W * np.conj(r["fft"]), NFFT)[:m]
+    es = cs[L:] - cs[:m]
+    ratio = cc / np.sqrt(np.maximum(es, 1e-12) * den_e)
+    k = int(np.argmax(ratio))
+    return float(ratio[k]), k
 
-    score = 0.72 * 波形相关 + 0.28 * 音色余弦，避免"波形像但音色不像"的错认。
+
+def _score_class(w, W, cs, n, r, out):
+    """算一类里最优的一份模板；同类多份变体之间按波形相关取最好。"""
+    ncc, lag = _ncc_at(w, W, cs, n, r)
+    seg = w[lag:lag + r["len"]]
+    cos = float(np.dot(bandvec(seg), r["band"]))
+    cur = out.get(r["id"])
+    if cur is None or ncc > cur[0][0]:
+        out[r["id"]] = ((ncc, cos), r, lag)
+
+
+def _order(out):
+    """排序：波形相关优先，音色余弦只在波形几乎并列时用来区分。
+
+    低分场景下音色余弦会失真（整段都对不齐时频谱形状也变），让它主导
+    会把"波形明明最像"的那类压下去，所以只当并列时的判据。
+    """
+    items = list(out.values())
+    items.sort(key=lambda p: (-p[0][0], -p[0][1]))
+    return [(W_NCC * p[0][0] + W_TONE * (p[0][1] + 1.0) * 0.5, p[1], p[2]) for p in items]
+
+
+def match(refs, win):
+    """返回 [(score, ref, lag16), ...] 降序，每类只保留最高分的一条。
+
+    score = 0.85 * 波形相关 + 0.15 * 音色余弦。
+    两段式：先用原始模板粗筛出最像的几类，再对这些类和它们的频响增广精算；
+    全都偏暗时退回全量精算，避免粗筛把真答案挡在外面。
     """
     w = preprocess(win)
     if len(w) < 64:
@@ -113,31 +183,26 @@ def match(refs, win):
     n = len(w)
     W = np.fft.rfft(w, NFFT)
     cs = np.concatenate(([0.0], np.cumsum(w * w, dtype=np.float64)))
-    out = []
+
+    rough = []
     for r in refs:
-        L = r["len"]
-        if L >= n:
-            t = np.fft.irfft(np.conj(r["fft"]) * W, NFFT)[:n]
-            cc = np.array([float(np.sum(t))])
-            es = np.array([cs[n]])
-        else:
-            m = n - L + 1
-            cc = np.fft.irfft(W * np.conj(r["fft"]), NFFT)[:m]
-            es = cs[L:] - cs[:m]
-        den = np.sqrt(np.maximum(es, 1e-12) * max(r["energy"], 1e-12))
-        ratio = cc / den
-        k = int(np.argmax(ratio))
-        out.append((float(ratio[k]), r, k))
-    out.sort(key=lambda p: -p[0])
-    # 前 4 名再过一道音色比对
-    ranked = []
-    for i, (ncc, r, k) in enumerate(out):
-        if i < 4:
-            seg = w[k:k + r["len"]]
-            cos = float(np.dot(bandvec(seg), r["band"]))
-            ncc = W_NCC * ncc + W_TONE * (cos + 1.0) * 0.5
-        ranked.append((ncc, r, k))
-    ranked.sort(key=lambda p: -p[0])
+        if r.get("aug"):
+            continue
+        rough.append((_ncc_at(w, W, cs, n, r)[0], r["id"]))
+    rough.sort(key=lambda p: -p[0])
+    keep = {p[1] for p in rough[:COARSE_K]}
+
+    best = {}
+    for r in refs:
+        if r["id"] in keep:
+            _score_class(w, W, cs, n, r, best)
+    ranked = _order(best)
+
+    if not ranked or ranked[0][0] < RECHECK_SCORE:
+        best = {}
+        for r in refs:
+            _score_class(w, W, cs, n, r, best)
+        ranked = _order(best)
     return ranked
 
 
@@ -334,12 +399,15 @@ class AutoCapture:
         print("监听设备：%s（%d Hz）" % (self.cap.dev["name"], self.cap.rate), flush=True)
 
     def _saved(self):
-        try:
-            p = os.path.join(HERE, self.SAVE)
-            if os.path.exists(p):
-                return open(p, encoding="utf-8").read().strip() or None
-        except Exception:
-            pass
+        # 免安装版的 HERE 是临时解压目录，写入会被清掉，所以状态统一放 %LOCALAPPDATA%
+        for p in (os.path.join(state_dir(), self.SAVE), os.path.join(HERE, self.SAVE)):
+            try:
+                if os.path.exists(p):
+                    v = open(p, encoding="utf-8").read().strip()
+                    if v:
+                        return v
+            except Exception:
+                pass
         return None
 
     def _open(self, want):
@@ -371,6 +439,102 @@ class AutoCapture:
 
 def rms(a):
     return float(np.sqrt(np.mean(a * a) + 1e-12))
+
+
+def pick_device_gui():
+    """弹窗列出所有回环设备，选一个记到 %LOCALAPPDATA%，下次启动直接听它。"""
+    import tkinter as tk
+    import pyaudiowpatch as pyaudio
+
+    pa = pyaudio.PyAudio()
+    try:
+        devs = list(pa.get_loopback_device_info_generator())
+    except Exception:
+        devs = []
+    if not devs:
+        print("没找到回环录制设备（WASAPI 不可用）。", flush=True)
+        return 1
+    try:
+        dflt = pa.get_default_wasapi_loopback()["index"]
+    except Exception:
+        dflt = None
+
+    saved = None
+    sp = os.path.join(state_dir(), AutoCapture.SAVE)
+    try:
+        if os.path.exists(sp):
+            saved = open(sp, encoding="utf-8").read().strip() or None
+    except Exception:
+        pass
+
+    root = tk.Tk()
+    root.title("战地行商 · 选输出设备")
+    root.geometry("680x430")
+    root.configure(bg="#0e1411")
+    root.attributes("-topmost", True)
+    tk.Label(root, text="游戏声音在哪个设备播，就听哪个。选完会记住，下次不用再选。",
+             bg="#0e1411", fg="#e9e4d6", font=("Microsoft YaHei", 10), anchor="w",
+             wraplength=650, justify="left").pack(fill="x", padx=14, pady=(12, 8))
+    lb = tk.Listbox(root, font=("Microsoft YaHei", 9), bg="#141b17", fg="#cfe0d2",
+                    selectbackground="#c9a24a", selectforeground="#0e1411",
+                    bd=0, highlightthickness=0, activestyle="none")
+    lb.pack(fill="both", expand=True, padx=14, pady=6)
+    for i, d in enumerate(devs):
+        mark = "   ← 系统默认" if d["index"] == dflt else ""
+        tail = "   ← 现在记住的" if saved and saved == d["name"] else ""
+        lb.insert("end", "%s%s%s   (%d Hz)" % (d["name"], mark, tail, d["defaultSampleRate"]))
+        if saved and saved == d["name"]:
+            lb.selection_set(i)
+
+    res = {"ok": False, "name": None}
+
+    def remember():
+        sel = lb.curselection()
+        if not sel:
+            return
+        res["name"] = devs[sel[0]]["name"]
+        res["ok"] = True
+        root.destroy()
+
+    def follow_default():
+        res["ok"] = True
+        res["name"] = None
+        root.destroy()
+
+    bar = tk.Frame(root, bg="#0e1411")
+    bar.pack(fill="x", padx=14, pady=(6, 14))
+    tk.Button(bar, text="记住这个", command=remember, bg="#c9a24a", fg="#0e1411",
+              bd=0, font=("Microsoft YaHei", 9), padx=14, pady=4, cursor="hand2").pack(side="left")
+    tk.Button(bar, text="跟着系统默认", command=follow_default, bg="#1a231d", fg="#8d968f",
+              bd=0, font=("Microsoft YaHei", 9), padx=14, pady=4,
+              cursor="hand2").pack(side="left", padx=8)
+    tk.Button(bar, text="取消", command=root.destroy, bg="#1a231d", fg="#8d968f",
+              bd=0, font=("Microsoft YaHei", 9), padx=14, pady=4,
+              cursor="hand2").pack(side="left")
+    lb.bind("<Double-Button-1>", lambda e: remember())
+    root.mainloop()
+
+    try:
+        pa.terminate()
+    except Exception:
+        pass
+
+    if not res["ok"]:
+        print("已取消，没有改动。", flush=True)
+        return 0
+    try:
+        if res["name"]:
+            with open(sp, "w", encoding="utf-8") as f:
+                f.write(res["name"])
+            print("已记住：%s（下次启动直接听它）" % res["name"], flush=True)
+        else:
+            if os.path.exists(sp):
+                os.remove(sp)
+            print("已改回：跟着系统默认输出", flush=True)
+    except Exception as e:
+        print("保存失败：%s" % e, flush=True)
+        return 1
+    return 0
 
 
 # ---------------------------------------------------------------- 界面
@@ -685,7 +849,7 @@ MIN_SCORE = 0.45    # 够这个分才当主结果
 MIN_MARGIN = 0.10   # 与次选的最小差距
 WEAK_SCORE = 0.26   # 低可信提示线
 VERBOSE = False
-TICK = 0.12         # --light 时放宽到 0.24，CPU 减半
+TICK = 0.16         # 比对间隔；--light 时放宽到 0.24。太短会让采集线程抢不到 CPU 而丢样
 
 
 
@@ -701,6 +865,7 @@ def listen(refs, overlay=None, seconds=None, cap=None):
     t0 = time.time()
     due = 0.0
     last_peak = {}
+    last_weak = {}      # 这一声上次报的是"低可信"吗？是的话允许被高分结果更正
     print("比对窗口 %.1fs，间隔 %.2fs" % (scan / rate, tick), flush=True)
     rec = [] if RECORD_PATH else None
     try:
@@ -736,14 +901,18 @@ def listen(refs, overlay=None, seconds=None, cap=None):
                 cap.last_name = dev_name
                 print("（现在的声音来自：%s）" % dev_name, flush=True)
             lp = last_peak.get(dev_name, -9.0)
+            lw = last_weak.get(dev_name, 0)
             if s0 >= MIN_SCORE and (s0 - s1) >= MIN_MARGIN:
-                # 同一次声音会被反复扫到，只报一次（按峰值时刻去重）
-                if peak_t - lp > 0.55 and now - peak_t < 1.3:
+                # 同一次声音会被反复扫到，只报一次（按峰值时刻去重）；
+                # 但之前只报了低可信的那一声，允许用这次的高分结果更正
+                if (peak_t - lp > 0.55 or lw) and now - peak_t < 1.3:
                     last_peak[dev_name] = peak_t
+                    last_weak[dev_name] = 0
                     report(res, overlay, weak=False)
-            elif s0 >= WEAK_SCORE and (s0 - s1) >= 0.06:
+            elif s0 >= WEAK_SCORE + 0.04 and (s0 - s1) >= 0.08:
                 if peak_t - lp > 0.55 and now - peak_t < 1.0:
                     last_peak[dev_name] = peak_t
+                    last_weak[dev_name] = 1
                     report(res, overlay, weak=True)
             elif VERBOSE and s0 >= 0.12:
                 print("  (略过 %.1fs) 最高 %02d %.2f 差距 %.2f" % (
@@ -762,10 +931,14 @@ def report(res, overlay, weak=False):
     best = res[0][1]
     scores = [res[0][0], res[1][0] if len(res) > 1 else 0.0]
     g = best["info"]
-    line = "%02d %-16s 相似 %.2f 差距 %.2f | %d件 %s-%s 中位%s%s" % (
+    alt = ""
+    if len(res) > 1 and (scores[0] - scores[1]) < 0.12:
+        g2 = res[1][1]["info"]
+        alt = "｜也可能是 %02d %s" % (g2["id"], g2["name"])
+    line = "%02d %-16s 相似 %.2f 差距 %.2f | %d件 %s-%s 中位%s%s%s" % (
         g["id"], g["name"], scores[0], scores[0] - scores[1], g["n"],
         wan(g["min"]), wan(g["max"]), wan(g["med"]),
-        (" 红货%d" % g["red"]) if g["red"] else "")
+        (" 红货%d" % g["red"]) if g["red"] else "", alt)
     if weak:
         line = "低可信 · " + line
     print(time.strftime("%H:%M:%S"), line, flush=True)
@@ -782,9 +955,10 @@ def check_offline(refs):
     """离线核对：把 17 段原声塞进带噪声的窗口，看能不能认回自己。"""
     rng = np.random.default_rng(20261114)
     ok_all, fails = [], []
+    ids = sorted({r["id"] for r in refs})
     for n_try in range(3):
-        for r in refs:
-            with wave.open(os.path.join(HERE, "snd", "snd%02d.wav" % r["id"]), "rb") as w:
+        for gid in ids:
+            with wave.open(os.path.join(HERE, "snd", "snd%02d.wav" % gid), "rb") as w:
                 ch = w.getnchannels()
                 raw = np.frombuffer(w.readframes(w.getnframes()), dtype="<i2").astype(np.float32) / 32768.0
             if ch > 1:
@@ -801,12 +975,12 @@ def check_offline(refs):
             win = win + noise
             res = match(refs, win)
             got = res[0][1]["id"]
-            if got == r["id"]:
-                ok_all.append((r["id"], res[0][0]))
+            if got == gid:
+                ok_all.append((gid, res[0][0]))
             else:
-                fails.append((r["id"], got, round(res[0][0], 2)))
+                fails.append((gid, got, round(res[0][0], 2)))
     hits = len(ok_all)
-    total = len(refs) * 3
+    total = len(ids) * 3
     print("离线核对（17 段×3 次，带噪声/不同音量/不同位置，SNR≈18dB）：命中 %d/%d" % (hits, total), flush=True)
     if fails:
         print("  错判：%s" % fails, flush=True)
@@ -830,6 +1004,8 @@ def main():
                     help="省 CPU 模式：比对间隔放宽到 0.24s，识别略慢一点点")
     ap.add_argument("--check", action="store_true",
                     help="离线核对识别：17 段原声加噪声/改音量，看是否都认回自己")
+    ap.add_argument("--select-device", action="store_true", dest="select_device",
+                    help="弹窗选回环设备并记住，下次启动直接听它")
     ap.add_argument("--boost", action="store_true",
                     help="自检时用放大音量的副本（环境噪声大时用）")
     ap.add_argument("--verbose", action="store_true")
@@ -842,6 +1018,9 @@ def main():
     global RECORD_PATH
     RECORD_PATH = args.record
     FLOOR = {"low": 0.012, "normal": 0.0025, "high": 0.0015}[args.sensitivity]
+
+    if args.select_device:
+        return pick_device_gui()
 
     groups = json.load(open(os.path.join(HERE, "groups.json"), encoding="utf-8"))
     refs = load_refs(os.path.join(HERE, "snd"), groups)
