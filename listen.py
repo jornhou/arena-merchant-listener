@@ -50,7 +50,7 @@ def load_refs(snd_dir, groups):
         if not os.path.exists(path):
             raise SystemExit(
                 "缺少声音样本：%s\n"
-                "本仓库不附带游戏原声（版权原因）。请按 docs/准备声音样本.md "
+                "本仓库不附带游戏原声（版权原因）。请按 docs/samples.md "
                 "把自己录制的 %d 段 wav 放进 snd\\ 后再运行。" % (path, len(groups))
             )
         with wave.open(path, "rb") as w:
@@ -418,7 +418,7 @@ class Overlay:
         self.idle = tk.Label(self.root, text="等待拾取音…", bg="#0e1411", fg="#8d968f",
                              font=("Microsoft YaHei", 11), anchor="w", justify="left")
         self.idle.place(x=16, y=16)
-        # 底部小字：正在听哪个设备（听错设备时点「选输出设备.bat」换一个）
+        # 底部小字：正在听哪个设备（听错设备时点「select-device.bat」换一个）
         self.devhint = tk.Label(self.root, text="", bg="#0e1411", fg="#5f6a63",
                                 font=("Microsoft YaHei", 8), anchor="w", justify="left")
         self.devhint.place(x=16, y=100)
