@@ -7,9 +7,18 @@ Copyright 2026 zhenninghou221-afk
 第三方素材与数据说明（重要）
 
 1. 游戏原声音频
-   本仓库不包含任何来自《暗区突围 / Arena Breakout》的游戏音频素材。
-   snd/ 目录由使用者自行录制或自行取得授权后填充。仓库 .gitignore 已默认
-   忽略 snd/*.wav，请不要把游戏音频提交到公开仓库。
+   本仓库的源码与 Git 历史不包含任何来自《暗区突围 / Arena Breakout》的游戏
+   音频素材。snd/ 目录由使用者自行录制或自行取得授权后填充。仓库 .gitignore
+   已默认忽略 snd/*.wav。
+
+   例外：本项目在 GitHub Releases 中提供的 Windows 可执行文件（
+   ArenaMerchantListener.exe 及其 zip 包）内置了 17 组拾取音样本及其放大副本，
+   以便使用者开箱即用。这些音频的著作权归腾讯 / MoreFun 所有，不属于本项目
+   作者，随 Release 分发仅用于学习交流与个人研究，不得用于商业目的，不得另行
+   再分发。内置素材的版权责任与对外分发责任由仓库所有者承担。
+
+   若相关权利人提出异议，会立即移除对应的 Release 资产，并保留源码部分继续
+   以 Apache-2.0 授权发布。
 
 2. 物品与价格数据
    groups.json、item-shapes-raw.json、item-list.txt 中的物品名称、占格尺寸、
