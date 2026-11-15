@@ -1,0 +1,30 @@
+# 声音样本：版权原因不入库，使用者自行放置
+snd/*.wav
+snd_boost/
+
+# 本机私有状态
+记住的设备.txt
+*.lnk
+
+# 打包与备份
+分享包/
+dist/
+build/
+*.exe
+*.zip
+*.bak
+listen.py.bak
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+
+# 编辑器 / 系统
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini
+.DS_Store

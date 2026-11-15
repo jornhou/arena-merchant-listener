@@ -1,0 +1,7 @@
+# 统一换行符，避免 clone 到 Linux/macOS 后 .bat 变成 LF 而无法运行
+* text=auto
+*.bat text eol=crlf
+*.py text eol=lf
+*.md text eol=lf
+*.wav binary
+*.png binary
