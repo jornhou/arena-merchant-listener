@@ -666,7 +666,7 @@ class Overlay:
             self.chip_frame.grid_columnconfigure(c, weight=1)
 
     def _render(self):
-        """按当前选的格型重排小窗：只有大金 + 概率 + 格型条。"""
+        """按当前选的格型重排小窗：红金紫 + 概率 + 格型条。"""
         g = self.last_info
         if g is None:
             return
@@ -787,11 +787,11 @@ def item_line(g, limit=6):
     return head
 
 
-BIG_MIN_RARITY = 5   # 5=金、6=红，这两种算"大金"
+BIG_MIN_RARITY = 4   # 4=紫、5=金、6=红；紫也要显示，这样一组里的值钱货是齐的
 
 
 def big_groups(g):
-    """把这一组的大金按格子归堆，返回 [(格式, [物品...]), ...]，按价钱降序。"""
+    """把这一组的红金紫按格子归堆，返回 [(格式, [物品...]), ...]，按价钱降序。"""
     big = [i for i in (g.get("items") or []) if i.get("r", 1) >= BIG_MIN_RARITY]
     bucket = {}
     for it in big:
@@ -806,7 +806,7 @@ def big_groups(g):
 
 
 def big_lines(g, max_rows=9, per_row=3, only=None):
-    """每个格子一行，只列大金。only=(宽,高) 时只留这一种格型。"""
+    """每个格子一行，列红金紫。only=(宽,高) 时只留这一种格型。"""
     rows = big_groups(g)
     if only is not None:
         rows = [r for r in rows if (r["gw"], r["gh"]) == tuple(only)]
@@ -821,16 +821,16 @@ def big_lines(g, max_rows=9, per_row=3, only=None):
         out.append("%s｜%s%s" % (r["label"], cells, more))
     if len(rows) > max_rows:
         rest = sum(len(r["items"]) for r in rows[max_rows:])
-        out.append("…还有 %d 种格子 %d 件大金" % (len(rows) - max_rows, rest))
+        out.append("…还有 %d 种格子 %d 件" % (len(rows) - max_rows, rest))
     return "\n".join(out)
 
 
 def big_summary(g):
     rows = big_groups(g)
     if not rows:
-        return "本组没有大金，只有小件"
+        return "本组没有红金紫，只有更小的件"
     total = sum(len(r["items"]) for r in rows)
-    return "大金 %d 件 · 按占格分 %d 行" % (total, len(rows))
+    return "红金紫 %d 件 · 按占格分 %d 行" % (total, len(rows))
 
 
 def wan(v):
